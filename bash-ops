@@ -1,0 +1,357 @@
+#!/bin/bash
+
+# BASH-Ops: A Declarative, Interactive Infrastructure Control Plane
+#
+# This script is the main engine and TUI for BASH-Ops. It orchestrates
+# reading the inventory and playbook, calculating configuration drift,
+# and allowing the user to interactively apply changes to remote systems.
+
+# --- Strict Mode & Error Handling ---
+set -euo pipefail
+
+# --- Source TUI Library ---
+source utils/tui.sh
+
+# --- Global State ---
+
+# Model
+INVENTORY_HOSTS=()
+declare -A HOST_VARS         # HOST_VARS[hostname]="key=val key2=val2"
+declare -A GROUP_VARS        # GROUP_VARS[groupname]="key=val"
+PLAYBOOK_RESOURCE_NAMES=() 
+declare -A RESOURCE_MAP      # RESOURCE_MAP[resourcename]="..."
+
+# View-Model
+DIFF_ITEMS=()
+STAGED_ITEMS=()
+
+# TUI State
+TUI_LOG_LINES=()
+FOCUSED_PANE=0 
+DIFF_PANE_SELECTION=0
+
+# --- Cleanup ---
+TMP_DIR=$(mktemp -d)
+trap 'tui_cleanup; rm -rf "$TMP_DIR"; exit 0' EXIT SIGINT SIGTERM
+
+#
+# SECTION: TUI Rendering
+#_______________________________________________________________________________
+
+tui_log() { TUI_LOG_LINES+=("[$(date +'%H:%M:%S')] $@"); }
+
+render_diff_pane() {
+    local row=$1 col=$2 width=$3 height=$4
+    local title="State Diff"
+    if [[ $FOCUSED_PANE -eq 0 ]]; then title="* $title *"; fi
+    tui_draw_box $row $col $width $height "$title"
+
+    for i in "${!DIFF_ITEMS[@]}"; do
+        if (( i >= height - 2 )); then break; fi
+        local line=${DIFF_ITEMS[$i]}
+        local prefix="[ ]"
+        local color=$C_RESET
+
+        for staged_idx in "${STAGED_ITEMS[@]}"; do
+            if [[ $staged_idx -eq $i ]]; then prefix="[x]"; break; fi
+        done
+
+        if [[ "$line" == *"[NEEDS CHANGE]"* ]]; then color=$C_YELLOW; fi
+        if [[ "$line" == *"[OK]"* ]]; then prefix="   "; color=$C_GREY; fi
+
+        if [[ $i -eq $DIFF_PANE_SELECTION && $FOCUSED_PANE -eq 0 ]]; then
+            tui_write_text $((row + i + 1)) $((col + 2)) "${C_BOLD}${color}> ${prefix} ${line}${C_RESET}"
+        else
+            tui_write_text $((row + i + 1)) $((col + 2)) "${color}  ${prefix} ${line}${C_RESET}"
+        fi
+    done
+}
+
+render_log_pane() {
+    local row=$1 col=$2 width=$3 height=$4
+    tui_draw_box $row $col $width $height "Execution Log"
+    local start_index=$(( ${#TUI_LOG_LINES[@]} - height + 2 ))
+    if (( start_index < 0 )); then start_index=0; fi
+    local display_lines=("${TUI_LOG_LINES[@]:$start_index}")
+    for i in "${!display_lines[@]}"; do
+        if (( i >= height - 2 )); then break; fi
+        tui_write_text $((row + i + 1)) $((col + 2)) "${display_lines[$i]}"
+    done
+}
+
+render_help_pane() {
+    local row=$1 col=$2 width=$3 height=$4
+    tui_draw_box $row $col $width $height "Help"
+    tui_write_text $((row+1)) $((col+2)) "j/k,↑/↓: Navigate | space: Stage/Unstage"
+    tui_write_text $((row+2)) $((col+2)) "a: Apply Staged | r: Refresh | q: Quit"
+}
+
+render_all() {
+    tui_clear_screen
+    local term_rows=$(tput lines)
+    local term_cols=$(tput cols)
+    local main_height=$((term_rows - 4))
+    render_diff_pane 1 1 $term_cols $main_height
+    render_log_pane $main_height 1 $((term_cols / 2)) 5
+    render_help_pane $main_height $((term_cols / 2)) $((term_cols - (term_cols/2) + 1)) 5
+    tui_move_cursor $term_rows 1
+}
+
+#
+# SECTION: Core Engine Logic
+#_______________________________________________________________________________
+
+# Full inventory parser supporting [group], [group:vars], and host variables.
+parse_inventory() {
+    local file=$1
+    tui_log "Parsing inventory: $file"
+    if [[ -x "$file" ]]; then
+        tui_log "Detected executable inventory. Running..."
+        local json_output
+        json_output=$("$file")
+        INVENTORY_HOSTS=($(echo "$json_output" | python3 -c 'import sys, json; data=json.load(sys.stdin); hosts=[h for g in data for h in data[g]["hosts"]]; print(" ".join(hosts))'))
+        # TODO: Add var parsing for dynamic inventories
+        return
+    fi
+
+    local current_group=""
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        line=$(echo "$line" | sed -e 's/#.*//' -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+        if [[ -z "$line" ]]; then continue; fi
+
+        if [[ "$line" =~ ^\[(.+):vars\]$ ]]; then
+            current_group=${BASH_REMATCH[1]}
+            GROUP_VARS[$current_group]=""
+        elif [[ "$line" =~ ^\[(.+)\]$ ]]; then
+            current_group=${BASH_REMATCH[1]}
+        else
+            if [[ -n "${GROUP_VARS[$current_group]:-}" ]]; then
+                GROUP_VARS[$current_group]+=" $line"
+            elif [[ -n "$current_group" ]]; then
+                local host=$(echo "$line" | awk '{print $1}')
+                local vars=$(echo "$line" | cut -d' ' -f2-)
+                INVENTORY_HOSTS+=("$host")
+                HOST_VARS[$host]=$vars
+            fi
+        fi
+    done < "$file"
+}
+
+# Robustly parses the playbook using a while-read loop.
+parse_playbook() {
+    tui_log "Parsing playbook: $1"
+    local current_block=""
+    while IFS= read -r line; do
+        if [[ "$line" == "---" ]]; then
+            if [[ -n "$current_block" ]]; then
+                local r_name=$(echo "$current_block" | grep '^NAME=' | cut -d'=' -f2)
+                if [[ -n "$r_name" ]]; then
+                    PLAYBOOK_RESOURCE_NAMES+=("$r_name")
+                    RESOURCE_MAP["$r_name"]="$current_block"
+                fi
+            fi
+            current_block=""
+        else
+            current_block+="$line"$ '\n'
+        fi
+    done < <(python3 utils/parser.py < "$1")
+    if [[ -n "$current_block" ]]; then
+        local r_name=$(echo "$current_block" | grep '^NAME=' | cut -d'=' -f2)
+        if [[ -n "$r_name" ]]; then
+            PLAYBOOK_RESOURCE_NAMES+=("$r_name")
+            RESOURCE_MAP["$r_name"]="$current_block"
+        fi
+    fi
+}
+
+# Executes a module on a remote host, handling variable injection and base64 decoding.
+execute_module() {
+    local host=$1 resource_params=$2 check_mode=$3
+    local type=$(echo "$resource_params" | grep '^TYPE=' | cut -d'=' -f2)
+    local mod_name=$(echo "$type" | cut -d'.' -f1)
+    local mod_file="modules/${mod_name}.py"
+    if [[ ! -f "$mod_file" ]]; then tui_log "ERROR: Module not found: $mod_file"; return 1; fi
+
+    local remote_path="/tmp/bash-ops-mod-$(date +%s)-$RANDOM.py"
+    scp -o BatchMode=yes -q "$mod_file" "${host}:${remote_path}"
+
+    # Prepare environment variables, including inventory vars and base64 decoding.
+    local env_vars=""
+    if [[ "$check_mode" == "true" ]]; then env_vars="BASH_OPS_CHECK_MODE=true "; fi
+    
+    # TODO: Add group vars
+    env_vars+="${HOST_VARS[$host]:-} "
+
+    # Process params, decoding base64 where needed
+    while IFS= read -r param; do
+        if [[ "$param" == *"_B64="* ]]; then
+            local key=$(echo "$param" | cut -d'=' -f1 | sed 's/_B64//')
+            local val=$(echo "$param" | cut -d'=' -f2- | base64 -d)
+            env_vars+="$key='$val' " # Quote to protect multi-line value
+        else
+            env_vars+="$param "
+        fi
+    done <<< "$resource_params"
+
+    local output
+    output=$(ssh -o BatchMode=yes "$host" "cd /tmp && env $env_vars python3 $remote_path; rm $remote_path")
+    echo "$output"
+}
+
+#
+# SECTION: Dependency Management
+#_______________________________________________________________________________
+
+# Performs a topological sort (Kahn's algorithm) on the playbook resources.
+# Returns an ordered list of resource names for execution.
+topological_sort() {
+    declare -A graph in_degree
+    local sorted_order=()
+    local resource_names=("$@")
+
+    for r_name in "${resource_names[@]}"; do
+        in_degree["$r_name"]=0
+        graph["$r_name"]=""
+    done
+
+    for r_name in "${resource_names[@]}"; do
+        local requires=$(echo "${RESOURCE_MAP[$r_name]}" | grep '^REQUIRES=' | cut -d'=' -f2 || true)
+        if [[ -n "$requires" ]]; then
+            local old_ifs=$IFS; IFS=',';
+            for dep in $requires;
+ do
+                graph["$dep"]+=" $r_name"
+                in_degree["$r_name"]=$((in_degree["$r_name"] + 1))
+            done
+            IFS=$old_ifs
+        fi
+    done
+
+    local queue=()
+    for r_name in "${resource_names[@]}"; do
+        if [[ ${in_degree[$r_name]} -eq 0 ]]; then queue+=("$r_name"); fi
+    done
+
+    local head=0
+    while [[ $head -lt ${#queue[@]} ]]; do
+        local u=${queue[$head]}; head=$((head+1))
+        sorted_order+=("$u")
+        for v in ${graph[$u]:-}; do
+            in_degree["$v"]=$((in_degree["$v"] - 1))
+            if [[ ${in_degree[$v]} -eq 0 ]]; then queue+=("$v"); fi
+        done
+    done
+
+    if [[ ${#sorted_order[@]} -ne ${#resource_names[@]} ]]; then
+        tui_log "ERROR: Circular dependency detected!"
+        render_all; sleep 5; exit 1
+    fi
+    echo "${sorted_order[@]}"
+}
+
+#
+# SECTION: Convergence Loop
+#_______________________________________________________________________________
+
+# Runs modules in check mode to determine configuration drift.
+run_check_mode() {
+    tui_log "Building dependency graph..."
+    render_all
+    local sorted_resources=($(topological_sort "${PLAYBOOK_RESOURCE_NAMES[@]}"))
+    tui_log "Check order: ${sorted_resources[*]}"
+    render_all; sleep 1
+
+    DIFF_ITEMS=() STAGED_ITEMS=() DIFF_PANE_SELECTION=0
+    
+    for r_name in "${sorted_resources[@]}"; do
+        local resource_def=${RESOURCE_MAP[$r_name]}
+        for host in "${INVENTORY_HOSTS[@]}"; do
+            tui_log "[$host] Checking: $r_name"
+            render_all; sleep 0.05
+            local result=$(execute_module "$host" "$resource_def" "true")
+            if [[ -z "$result" ]]; then continue; fi
+            local changed=$(echo "$result" | python3 -c "import sys, json; print(json.load(sys.stdin).get('changed', False))")
+            if [[ "$changed" == "True" ]]; then DIFF_ITEMS+=("[NEEDS CHANGE] $host: $r_name"); else DIFF_ITEMS+=("[OK] $host: $r_name"); fi
+            render_all
+        done
+    done
+    tui_log "Check finished."
+}
+
+# Runs modules in apply mode for changes staged by the user.
+run_apply_mode() {
+    if [[ ${#STAGED_ITEMS[@]} -eq 0 ]]; then tui_log "No changes staged to apply."; return; fi
+    tui_log "Applying ${#STAGED_ITEMS[@]} staged changes..."
+    render_all; sleep 1
+    local applied_count=0
+    for item_idx in "${STAGED_ITEMS[@]}"; do
+        local item_desc=${DIFF_ITEMS[$item_idx]}
+        local host=$(echo "$item_desc" | awk '{print $3}' | sed 's/://')
+        local r_name=$(echo "$item_desc" | awk '{$1=$2=$3=""; print $0}' | sed 's/^[ ]*//')
+        tui_log "[$host] Applying: $r_name"
+        render_all; sleep 0.05
+        local resource_def=${RESOURCE_MAP[$r_name]}
+        local result=$(execute_module "$host" "$resource_def" "false")
+        local success=$(echo "$result" | python3 -c "import sys, json; print(json.load(sys.stdin).get('success', False))")
+        if [[ "$success" == "True" ]]; then tui_log "[$host] SUCCESS: $r_name"; else tui_log "[$host] FAILED: $r_name"; fi
+        applied_count=$((applied_count + 1))
+        render_all
+    done
+    tui_log "Apply finished. Applied $applied_count changes."
+    sleep 1; run_check_mode
+}
+
+#
+# SECTION: Input & Main Loop
+#_______________________________________________________________________________
+
+# Handles a single key press from the user.
+handle_input() {
+    read -rsn1 key
+    # Handle 3-byte ANSI escape sequences for arrow keys.
+    if [[ "$key" == $'' ]]; then
+        read -rsn2 -t 0.1 key
+        if [[ "$key" == '[A' ]]; then move_selection -1; return; fi # Up
+        if [[ "$key" == '[B' ]]; then move_selection 1; return; fi # Down
+    fi
+    # Handle single-key presses.
+    case "$key" in
+        'q') tui_cleanup; exit 0 ;; 
+        'j'|'J') move_selection 1 ;; 
+        'k'|'K') move_selection -1 ;; 
+        ' ') toggle_stage_item ;; 
+        'a'|'A') run_apply_mode ;; 
+        'r'|'R') run_check_mode ;; 
+    esac
+}
+
+move_selection() {
+    local dir=$1
+    local max_idx=$(( ${#DIFF_ITEMS[@]} - 1 ))
+    DIFF_PANE_SELECTION=$((DIFF_PANE_SELECTION + dir))
+    if (( DIFF_PANE_SELECTION < 0 )); then DIFF_PANE_SELECTION=0; fi
+    if (( DIFF_PANE_SELECTION > max_idx )); then DIFF_PANE_SELECTION=$max_idx; fi
+}
+
+toggle_stage_item() {
+    local idx=$DIFF_PANE_SELECTION
+    if [[ "${DIFF_ITEMS[$idx]}" != *"[NEEDS CHANGE]"* ]]; then return; fi
+    local new_staged=()
+    local found=false
+    for staged_idx in "${STAGED_ITEMS[@]}"; do
+        if [[ $staged_idx -eq $idx ]]; then found=true; else new_staged+=("$staged_idx"); fi
+    done
+    if ! $found; then new_staged+=("$idx"); fi
+    STAGED_ITEMS=("${new_staged[@]}")
+}
+
+main() {
+    if [[ "$#" -ne 2 ]]; then echo "Usage: $0 <inventory> <playbook>" >&2; exit 1; fi
+    tui_init
+    parse_inventory "$1"
+    parse_playbook "$2"
+    run_check_mode
+    while true; do render_all; handle_input; done
+}
+
+main "$@"

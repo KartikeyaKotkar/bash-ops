@@ -1,0 +1,20 @@
+resources:
+  - name: install_nginx
+    type: package.present
+    params:
+      name: nginx
+
+  - name: configure_nginx
+    type: file.managed
+    params:
+      path: /etc/nginx/sites-available/default
+      source: files/nginx.conf
+    requires:
+      - install_nginx
+
+  - name: start_nginx
+    type: service.running
+    params:
+      name: nginx
+    requires:
+      - configure_nginx
