@@ -47,18 +47,20 @@ main() {
     info "Installing Python dependencies via pip..."
     "$VENV_DIR/bin/pip" install --upgrade pip
     "$VENV_DIR/bin/pip" install -r "$INSTALL_DIR/requirements.txt"
-    # 7. Create wrapper script that activates venv before running bash-ops
+    # 7. Create wrapper script that executes bash-ops as a Bash script
     info "Creating executable wrapper..."
-    cat > "$BIN_DIR/$EXE_NAME" << 'EOF'
+    cat > "$BIN_DIR/$EXE_NAME" << 'WRAPPER_EOF'
 #!/bin/bash
 INSTALL_DIR="/usr/local/lib/bash-ops"
 VENV_DIR="$INSTALL_DIR/venv"
-source "$VENV_DIR/bin/activate"
-exec python3 "$INSTALL_DIR/bash-ops" "$@"
-EOF
+export PATH="$VENV_DIR/bin:$PATH"
+exec bash "$INSTALL_DIR/bash-ops" "$@"
+WRAPPER_EOF
     chmod +x "$BIN_DIR/$EXE_NAME"
-    # 8. Set executable permissions on main script
+
+    # 8. Ensure main bash-ops script is executable
     chmod +x "$INSTALL_DIR/bash-ops"
+
     info "Installation complete!"
     info "You can now run the application by typing 'bash-ops' in your terminal."
 }
