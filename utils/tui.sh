@@ -25,8 +25,14 @@ C_GREY='\e[90m'
 # Initializes the TUI environment.
 # Saves the screen state and hides the cursor.
 tui_init() {
-    tput smcup # Save screen
-    tput civis # Hide cursor
+    if [[ -z "${TERM:-}" ]] || ! tput cols >/dev/null 2>&1; then
+        echo "Error: Terminal is not fully supported. Please ensure the TERM environment variable is set correctly (e.g., 'export TERM=xterm-256color')." >&2
+        exit 1
+    fi
+
+    tput smcup 2>/dev/null || { echo "Error: Terminal does not support alternate screen mode (smcup)." >&2; exit 1; }
+    tput civis 2>/dev/null || { echo "Error: Terminal does not support hiding the cursor (civis)." >&2; # This is non-fatal, so we just print a message.
+    }
 }
 
 # Restores the terminal to its original state.
