@@ -7,7 +7,8 @@
 # and allowing the user to interactively apply changes to remote systems.
 
 # --- Strict Mode & Error Handling ---
-set -euo pipefail
+# set -euo pipefail # Temporarily disabled for debugging
+set -uo pipefail
 
 # --- Source TUI Library ---
 source utils/tui.sh
@@ -18,7 +19,7 @@ source utils/tui.sh
 INVENTORY_HOSTS=()
 declare -A HOST_VARS         # HOST_VARS[hostname]="key=val key2=val2"
 declare -A GROUP_VARS        # GROUP_VARS[groupname]="key=val"
-PLAYBOOK_RESOURCE_NAMES=() 
+PLAYBOOK_RESOURCE_NAMES=()
 declare -A RESOURCE_MAP      # RESOURCE_MAP[resourcename]="..."
 
 # View-Model
@@ -27,7 +28,7 @@ STAGED_ITEMS=()
 
 # TUI State
 TUI_LOG_LINES=()
-FOCUSED_PANE=0 
+FOCUSED_PANE=0
 DIFF_PANE_SELECTION=0
 
 # --- Cleanup ---
@@ -178,7 +179,7 @@ execute_module() {
     # Prepare environment variables, including inventory vars and base64 decoding.
     local env_vars=""
     if [[ "$check_mode" == "true" ]]; then env_vars="BASH_OPS_CHECK_MODE=true "; fi
-    
+
     # TODO: Add group vars
     env_vars+="${HOST_VARS[$host]:-} "
 
@@ -262,7 +263,7 @@ run_check_mode() {
     render_all; sleep 1
 
     DIFF_ITEMS=() STAGED_ITEMS=() DIFF_PANE_SELECTION=0
-    
+
     for r_name in "${sorted_resources[@]}"; do
         local resource_def=${RESOURCE_MAP[$r_name]}
         for host in "${INVENTORY_HOSTS[@]}"; do
@@ -316,12 +317,12 @@ handle_input() {
     fi
     # Handle single-key presses.
     case "$key" in
-        'q') tui_cleanup; exit 0 ;; 
-        'j'|'J') move_selection 1 ;; 
-        'k'|'K') move_selection -1 ;; 
-        ' ') toggle_stage_item ;; 
-        'a'|'A') run_apply_mode ;; 
-        'r'|'R') run_check_mode ;; 
+        'q') tui_cleanup; exit 0 ;;
+        'j'|'J') move_selection 1 ;;
+        'k'|'K') move_selection -1 ;;
+        ' ') toggle_stage_item ;;
+        'a'|'A') run_apply_mode ;;
+        'r'|'R') run_check_mode ;;
     esac
 }
 
@@ -346,12 +347,33 @@ toggle_stage_item() {
 }
 
 main() {
-    if [[ "$#" -ne 2 ]]; then echo "Usage: $0 <inventory> <playbook>" >&2; exit 1; fi
+    echo "[DEBUG] Starting main function..."
+    if [[ "$#" -ne 2 ]]; then
+        echo "Usage: $0 <inventory> <playbook>" >&2
+        exit 1
+    fi
+
+    echo "[DEBUG] Initializing TUI..."
     tui_init
+    echo "[DEBUG] TUI Initialized."
+
+    echo "[DEBUG] Parsing inventory: $1"
     parse_inventory "$1"
+    echo "[DEBUG] Inventory parsed."
+
+    echo "[DEBUG] Parsing playbook: $2"
     parse_playbook "$2"
+    echo "[DEBUG] Playbook parsed."
+
+    echo "[DEBUG] Running initial check mode..."
     run_check_mode
-    while true; do render_all; handle_input; done
+    echo "[DEBUG] Initial check mode finished."
+
+    echo "[DEBUG] Entering main input loop..."
+    while true; do
+        render_all
+        handle_input
+    done
 }
 
 main "$@"
